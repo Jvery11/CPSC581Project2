@@ -20,21 +20,22 @@ import {
   }
   
   /* -------------------- DOM (expert overlay) -------------------- */
-  const webcamButton = document.getElementById("webcamButton"); // expert only
-  const video = document.getElementById("webcam");              // expert only
-  const mpCanvas = document.getElementById("output_canvas");    // expert only
+  const webcamButton = document.getElementById("webcamButton");
+  const video = document.getElementById("webcam");
+  const mpCanvas = document.getElementById("output_canvas");
   const mpCtx = mpCanvas ? mpCanvas.getContext("2d") : null;
-  const expertDebug = document.getElementById("expert_debug");  // expert only
+  const expertDebug = document.getElementById("expert_debug");
   
-  /* -------------------- DOM (scene canvases) -------------------- */
-  const sceneCanvasExpert = document.getElementById("scene_canvas");          // expert only
-  const sceneCanvasNovice = document.getElementById("scene_canvas_novice");   // novice only
-  const noviceReadout = document.getElementById("novice_readout");            // novice only
+  /* -------------------- DOM (3D model + glow overlays) -------------------- */
+  const mvExpert = document.getElementById("mv_expert"); // expert only
+  const mvNovice = document.getElementById("mv_novice"); // novice only
+  const glowCanvasExpert = document.getElementById("glow_canvas_expert");
+  const glowCanvasNovice = document.getElementById("glow_canvas_novice");
+  const noviceReadout = document.getElementById("novice_readout");
   
   /* -------------------- Shared render state -------------------- */
-  const MIRRORED_VIEW = true; // webcam/video is mirrored (rotateY(180deg) in CSS)
-  
-  const EDGE_ZONE = 0.07; // 7% thickness edge zone
+  const MIRRORED_VIEW = true;
+  const EDGE_ZONE = 0.07;
   
   // Hand landmark indices
   const INDEX_TIP = 8;
@@ -49,45 +50,87 @@ import {
   const PINKY_TIP = 20;
   const PINKY_PIP = 18;
   
-  // Object state (authoritative on expert)
-  const BOX_SIZE = 60;
-  const MOVE_PER_FRAME = 6;
-  const ROTATE_PER_FRAME = 0.03;
+  /* -------------------- Object state (expert authoritative) --------------------
+     Position: normalized (-1..+1) mapped to CSS translate
+     Rotation: degrees in x/y/z mapped to <model-viewer orientation="xdeg ydeg zdeg">
+  ------------------------------------------------------------------------------- */
+  const MOVE_PER_FRAME = 0.06;        // normalized per frame
+  const ROTATE_DEG_PER_FRAME = 2.0;   // degrees per frame
   
-  let objX = 0;
-  let objY = 0;
-  let objAngle = 0;
+  let objNX = 0;
+  let objNY = 0;
+  
+  let rotX = 0;
+  let rotY = 0;
+  let rotZ = 0;
   
   // novice receives this from WS
   let remoteState = {
-    x: null,
-    y: null,
-    angle: 0,
+    nx: null,
+    ny: null,
+    rotX: 0,
+    rotY: 0,
+    rotZ: 0,
     glowEdge: null,
-    tool: "none"
+    tool: "none",
+    axis: "none"
   };
   
-  // Used by expert to reduce WS spam a bit
   let lastSendMs = 0;
-  const SEND_INTERVAL_MS = 33; // ~30fps
+  const SEND_INTERVAL_MS = 33;
   
   /* -------------------- Geometry helpers -------------------- */
   function edgeFromPoint(pt) {
     let x = pt.x;
     const y = pt.y;
   
-    // If the preview is mirrored, flip the x coordinate
     if (MIRRORED_VIEW) x = 1 - x;
   
-    if (x < EDGE_ZONE) return "LEFT";
-    if (x > 1 - EDGE_ZONE) return "RIGHT";
-    if (y < EDGE_ZONE) return "TOP";
-    if (y > 1 - EDGE_ZONE) return "BOTTOM";
+    const nearLeft = x < EDGE_ZONE;
+    const nearRight = x > 1 - EDGE_ZONE;
+    const nearTop = y < EDGE_ZONE;
+    const nearBottom = y > 1 - EDGE_ZONE;
+  
+    // corners first
+    if (nearTop && nearLeft) return "TOP_LEFT";
+    if (nearTop && nearRight) return "TOP_RIGHT";
+    if (nearBottom && nearLeft) return "BOTTOM_LEFT";
+    if (nearBottom && nearRight) return "BOTTOM_RIGHT";
+  
+    // edges
+    if (nearLeft) return "LEFT";
+    if (nearRight) return "RIGHT";
+    if (nearTop) return "TOP";
+    if (nearBottom) return "BOTTOM";
+  
     return null;
   }
   
   function drawEdgeGlow(ctx, w, h, edge) {
     if (!edge) return;
+  
+    // Corner: glow both relevant edges
+    if (edge === "TOP_LEFT") {
+      drawEdgeGlow(ctx, w, h, "TOP");
+      drawEdgeGlow(ctx, w, h, "LEFT");
+      return;
+    }
+    if (edge === "TOP_RIGHT") {
+      drawEdgeGlow(ctx, w, h, "TOP");
+      drawEdgeGlow(ctx, w, h, "RIGHT");
+      return;
+    }
+    if (edge === "BOTTOM_LEFT") {
+      drawEdgeGlow(ctx, w, h, "BOTTOM");
+      drawEdgeGlow(ctx, w, h, "LEFT");
+      return;
+    }
+    if (edge === "BOTTOM_RIGHT") {
+      drawEdgeGlow(ctx, w, h, "BOTTOM");
+      drawEdgeGlow(ctx, w, h, "RIGHT");
+      return;
+    }
+  
     const t = Math.max(2, Math.round(Math.min(w, h) * EDGE_ZONE));
   
     ctx.save();
@@ -103,19 +146,7 @@ import {
     ctx.restore();
   }
   
-  function drawRotatedSquare(ctx, x, y, size, angleRad) {
-    ctx.save();
-    ctx.translate(x, y);
-    ctx.rotate(angleRad);
-    ctx.lineWidth = 4;
-    ctx.strokeStyle = "#000000";
-    ctx.shadowBlur = 0;
-    ctx.shadowColor = "transparent";
-    ctx.strokeRect(-size / 2, -size / 2, size, size);
-    ctx.restore();
-  }
-  
-  // Mirrors MP handedness label if the view is mirrored
+  // Mirror handedness label if mirrored view
   function perceivedHandLabel(mpLabel) {
     if (!mpLabel) return null;
     if (!MIRRORED_VIEW) return mpLabel;
@@ -124,7 +155,6 @@ import {
   
   /* -------------------- Finger helpers -------------------- */
   function isFingerUp(landmarks, tipIdx, pipIdx) {
-    // smaller y = higher on screen
     return landmarks[tipIdx].y < landmarks[pipIdx].y;
   }
   
@@ -150,52 +180,77 @@ import {
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(1, Math.round(rect.width));
     const h = Math.max(1, Math.round(rect.height));
-    const needResize = canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr);
+  
+    const needResize =
+      canvas.width !== Math.round(w * dpr) ||
+      canvas.height !== Math.round(h * dpr);
   
     if (needResize) {
       canvas.width = Math.round(w * dpr);
       canvas.height = Math.round(h * dpr);
     }
   
-    // Draw in CSS pixels
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     return { w, h };
   }
   
+  /* -------------------- Apply to <model-viewer> -------------------- */
+  function applyPoseToModelViewer(el, nx, ny, xDeg, yDeg, zDeg) {
+    if (!el) return;
+  
+    // move element in screen space
+    const cx = Math.max(-1, Math.min(1, nx));
+    const cy = Math.max(-1, Math.min(1, ny));
+  
+    const txPct = cx * 35;
+    const tyPct = cy * 35;
+  
+    el.style.transformOrigin = "50% 50%";
+    el.style.transform = `translate(${txPct}%, ${tyPct}%)`;
+  
+    // rotate model in 3D space via orientation (degrees)
+    el.orientation = `${xDeg}deg ${yDeg}deg ${zDeg}deg`;
+  }
+  
   /* ============================================================
-     NOVICE: render-only (no webcam, no hand detection)
+     NOVICE: render-only
      ============================================================ */
   let noviceRaf = null;
   
   function startNovice() {
-    if (!sceneCanvasNovice || !noviceReadout) return;
-  
     function render() {
-      const ctx = sceneCanvasNovice.getContext("2d");
-      const { w, h } = fitCanvasToCSS(sceneCanvasNovice, ctx);
-  
-      ctx.clearRect(0, 0, w, h);
-  
-      // If we haven't received state yet, show waiting text
-      if (remoteState.x == null || remoteState.y == null) {
-        noviceReadout.textContent = "Waiting for expert…";
-        noviceRaf = requestAnimationFrame(render);
-        return;
+      // glow overlay
+      if (glowCanvasNovice) {
+        const ctx = glowCanvasNovice.getContext("2d");
+        const { w, h } = fitCanvasToCSS(glowCanvasNovice, ctx);
+        ctx.clearRect(0, 0, w, h);
+        drawEdgeGlow(ctx, w, h, remoteState.glowEdge);
       }
   
-      // Edge glow from expert
-      drawEdgeGlow(ctx, w, h, remoteState.glowEdge);
+      if (remoteState.nx != null && remoteState.ny != null) {
+        applyPoseToModelViewer(
+          mvNovice,
+          remoteState.nx,
+          remoteState.ny,
+          remoteState.rotX,
+          remoteState.rotY,
+          remoteState.rotZ
+        );
+      }
   
-      // Draw square
-      drawRotatedSquare(ctx, remoteState.x, remoteState.y, BOX_SIZE, remoteState.angle);
-  
-      // Novice readout: NO hand stuff
-      noviceReadout.textContent = [
-        `Tool: ${remoteState.tool || "none"}`,
-        `Edge: ${remoteState.glowEdge || "none"}`,
-        `Object: (${Math.round(remoteState.x)}, ${Math.round(remoteState.y)})`,
-        `Angle: ${remoteState.angle.toFixed(2)}`
-      ].join("\n");
+      if (noviceReadout) {
+        if (remoteState.nx == null || remoteState.ny == null) {
+          noviceReadout.textContent = "Waiting for expert…";
+        } else {
+          noviceReadout.textContent = [
+            `Tool: ${remoteState.tool || "none"}`,
+            `Axis: ${remoteState.axis || "none"}`,
+            `Edge: ${remoteState.glowEdge || "none"}`,
+            `Pos(n): (${remoteState.nx.toFixed(2)}, ${remoteState.ny.toFixed(2)})`,
+            `Rot(deg): x=${remoteState.rotX.toFixed(1)} y=${remoteState.rotY.toFixed(1)} z=${remoteState.rotZ.toFixed(1)}`
+          ].join("\n");
+        }
+      }
   
       noviceRaf = requestAnimationFrame(render);
     }
@@ -204,13 +259,12 @@ import {
   }
   
   /* ============================================================
-     EXPERT: MediaPipe + state broadcasting + expert scene render
+     EXPERT: MediaPipe + broadcast
      ============================================================ */
   let handLandmarker = null;
   let runningMode = "IMAGE";
   let webcamRunning = false;
   let lastVideoTime = -1;
-  
   let expertRaf = null;
   
   async function createLandmarker() {
@@ -234,14 +288,12 @@ import {
   function stopWebcam() {
     if (!video) return;
     const stream = video.srcObject;
-    if (stream && stream.getTracks) {
-      stream.getTracks().forEach((t) => t.stop());
-    }
+    if (stream && stream.getTracks) stream.getTracks().forEach((t) => t.stop());
     video.srcObject = null;
   }
   
   function startExpert() {
-    if (!webcamButton || !video || !mpCanvas || !sceneCanvasExpert || !expertDebug) return;
+    if (!webcamButton || !video || !mpCanvas || !expertDebug) return;
   
     webcamButton.addEventListener("click", async () => {
       if (!handLandmarker) {
@@ -259,21 +311,13 @@ import {
         return;
       }
   
-      const constraints = {
+      const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 } }
-      };
-  
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      });
       video.srcObject = stream;
   
       video.addEventListener("loadeddata", predictWebcam, { once: true });
     });
-  
-    // Initial object placement (center once we know scene size)
-    const sceneCtx = sceneCanvasExpert.getContext("2d");
-    const { w, h } = fitCanvasToCSS(sceneCanvasExpert, sceneCtx);
-    objX = Math.round(w / 2);
-    objY = Math.round(h / 2);
   }
   
   async function predictWebcam() {
@@ -284,8 +328,6 @@ import {
       await handLandmarker.setOptions({ runningMode: "VIDEO" });
     }
   
-    // Fit MediaPipe overlay canvas to the video element’s CSS size
-    // (We still set actual size below from video.videoWidth/Height for correct coords)
     mpCanvas.width = video.videoWidth;
     mpCanvas.height = video.videoHeight;
   
@@ -300,11 +342,10 @@ import {
       return;
     }
   
-    // Clear MP canvas
+    // clear MP canvas
     mpCtx.save();
     mpCtx.clearRect(0, 0, mpCanvas.width, mpCanvas.height);
   
-    // Hard reset any visual state
     mpCtx.globalAlpha = 1;
     mpCtx.filter = "none";
     mpCtx.shadowBlur = 0;
@@ -318,7 +359,6 @@ import {
     let rightHand = null;
     let leftHand = null;
   
-    // Draw hand skeletons (expert only)
     for (let i = 0; i < landmarksArr.length; i++) {
       const landmarks = landmarksArr[i];
   
@@ -334,7 +374,7 @@ import {
   
     mpCtx.restore();
   
-    // Determine tool from LEFT hand
+    // tool from LEFT hand
     let tool = "none";
     const leftOne = leftHand ? isOneFingerUp(leftHand) : false;
     const leftTwo = leftHand ? isTwoFingersUp(leftHand) : false;
@@ -342,58 +382,108 @@ import {
     if (leftTwo) tool = "Rotate";
     else if (leftOne) tool = "Align";
   
-    // Scene canvas render (expert sees object + edge glow)
-    const sceneCtx = sceneCanvasExpert.getContext("2d");
-    const { w, h } = fitCanvasToCSS(sceneCanvasExpert, sceneCtx);
-  
-    // Keep object inside bounds
-    objX = Math.max(0, Math.min(w, objX));
-    objY = Math.max(0, Math.min(h, objY));
-  
-    // Right-hand edge control (only when tool active)
+    // right-hand edge control
     let glowEdge = null;
+    let axis = "none";
+  
     if ((tool === "Align" || tool === "Rotate") && rightHand) {
-      const indexTip = rightHand[INDEX_TIP];
-      glowEdge = edgeFromPoint(indexTip);
+      glowEdge = edgeFromPoint(rightHand[INDEX_TIP]);
   
       if (tool === "Align") {
-        if (glowEdge === "LEFT") objX -= MOVE_PER_FRAME;
-        if (glowEdge === "RIGHT") objX += MOVE_PER_FRAME;
-        if (glowEdge === "TOP") objY -= MOVE_PER_FRAME;
-        if (glowEdge === "BOTTOM") objY += MOVE_PER_FRAME;
+        if (glowEdge === "LEFT") objNX -= MOVE_PER_FRAME;
+        if (glowEdge === "RIGHT") objNX += MOVE_PER_FRAME;
+        if (glowEdge === "TOP") objNY -= MOVE_PER_FRAME;
+        if (glowEdge === "BOTTOM") objNY += MOVE_PER_FRAME;
+  
+        // also allow corners to move diagonally in align mode
+        if (glowEdge === "TOP_LEFT") { objNX -= MOVE_PER_FRAME; objNY -= MOVE_PER_FRAME; }
+        if (glowEdge === "TOP_RIGHT") { objNX += MOVE_PER_FRAME; objNY -= MOVE_PER_FRAME; }
+        if (glowEdge === "BOTTOM_LEFT") { objNX -= MOVE_PER_FRAME; objNY += MOVE_PER_FRAME; }
+        if (glowEdge === "BOTTOM_RIGHT") { objNX += MOVE_PER_FRAME; objNY += MOVE_PER_FRAME; }
       }
   
       if (tool === "Rotate") {
-        if (glowEdge === "LEFT") objAngle -= ROTATE_PER_FRAME;
-        if (glowEdge === "RIGHT") objAngle += ROTATE_PER_FRAME;
+        // CORNERS => Z rotation (left corners = -, right corners = +)
+        if (glowEdge === "TOP_LEFT" || glowEdge === "BOTTOM_LEFT") {
+          axis = "Z";
+          rotZ -= ROTATE_DEG_PER_FRAME;
+        } else if (glowEdge === "TOP_RIGHT" || glowEdge === "BOTTOM_RIGHT") {
+          axis = "Z";
+          rotZ += ROTATE_DEG_PER_FRAME;
+        }
+        // TOP/BOTTOM => X rotation
+        else if (glowEdge === "TOP") {
+          axis = "X";
+          rotX -= ROTATE_DEG_PER_FRAME;
+        } else if (glowEdge === "BOTTOM") {
+          axis = "X";
+          rotX += ROTATE_DEG_PER_FRAME;
+        }
+        // LEFT/RIGHT => Y rotation
+        else if (glowEdge === "LEFT") {
+          axis = "Y";
+          rotY -= ROTATE_DEG_PER_FRAME;
+        } else if (glowEdge === "RIGHT") {
+          axis = "Y";
+          rotY += ROTATE_DEG_PER_FRAME;
+        }
       }
     }
   
-    // Render expert scene
-    sceneCtx.clearRect(0, 0, w, h);
-    drawEdgeGlow(sceneCtx, w, h, glowEdge);
-    drawRotatedSquare(sceneCtx, objX, objY, BOX_SIZE, objAngle);
+    // clamp pos
+    objNX = Math.max(-1, Math.min(1, objNX));
+    objNY = Math.max(-1, Math.min(1, objNY));
   
-    // Expert debug (includes hand info)
-    expertDebug.textContent = [
-      `Tool: ${tool}`,
-      `Left hand: ${leftHand ? "detected" : "not detected"} ${leftHand ? (leftTwo ? "(2 fingers)" : leftOne ? "(1 finger)" : "(no tool)") : ""}`,
-      `Right hand: ${rightHand ? "detected" : "not detected"}`,
-      (tool === "aligning" || tool === "rotate") ? `Edge: ${glowEdge ?? "none"}` : "Edge: (tool inactive)",
-      `Object: (${Math.round(objX)}, ${Math.round(objY)}) angle=${objAngle.toFixed(2)}`
-    ].join("\n");
+    // clamp X a bit so it doesn't flip too wildly
+    rotX = Math.max(-85, Math.min(85, rotX));
   
-    // Broadcast state to room (novice renders this)
+    // wrap Y/Z for sanity
+    if (rotY > 180) rotY -= 360;
+    if (rotY < -180) rotY += 360;
+  
+    if (rotZ > 180) rotZ -= 360;
+    if (rotZ < -180) rotZ += 360;
+  
+    // apply to expert model
+    applyPoseToModelViewer(mvExpert, objNX, objNY, rotX, rotY, rotZ);
+  
+    // glow overlay
+    if (glowCanvasExpert) {
+      const ctx = glowCanvasExpert.getContext("2d");
+      const { w, h } = fitCanvasToCSS(glowCanvasExpert, ctx);
+      ctx.clearRect(0, 0, w, h);
+      drawEdgeGlow(ctx, w, h, glowEdge);
+    }
+  
+    // debug
+    if (expertDebug) {
+      expertDebug.textContent = [
+        `Tool: ${tool}`,
+        `Left hand: ${leftHand ? "detected" : "not detected"} ${
+          leftHand ? (leftTwo ? "(2 fingers)" : leftOne ? "(1 finger)" : "(no tool)") : ""
+        }`,
+        `Right hand: ${rightHand ? "detected" : "not detected"}`,
+        (tool === "Align" || tool === "Rotate") ? `Edge: ${glowEdge ?? "none"}` : "Edge: (tool inactive)",
+        `Pos(n): (${objNX.toFixed(2)}, ${objNY.toFixed(2)})`,
+        `Rotate axis: ${axis}`,
+        `Rot(deg): x=${rotX.toFixed(1)} y=${rotY.toFixed(1)} z=${rotZ.toFixed(1)}`
+      ].join("\n");
+    }
+  
+    // broadcast
     const t = performance.now();
     if (t - lastSendMs >= SEND_INTERVAL_MS) {
       lastSendMs = t;
       wsSend({
         type: "state",
-        x: objX,
-        y: objY,
-        angle: objAngle,
+        nx: objNX,
+        ny: objNY,
+        rotX,
+        rotY,
+        rotZ,
         glowEdge,
-        tool
+        tool,
+        axis
       });
     }
   
@@ -401,40 +491,37 @@ import {
   }
   
   /* ============================================================
-     Receive WS messages (novice updates, expert could ignore)
+     Receive WS messages
      ============================================================ */
   window.addEventListener("app:ws", (e) => {
     const msg = e.detail;
     if (!msg || typeof msg !== "object") return;
   
     if (msg.type === "state") {
-      // Update remote state for novice renderer
       remoteState = {
-        x: msg.x ?? remoteState.x,
-        y: msg.y ?? remoteState.y,
-        angle: msg.angle ?? remoteState.angle,
+        nx: msg.nx ?? remoteState.nx,
+        ny: msg.ny ?? remoteState.ny,
+        rotX: msg.rotX ?? remoteState.rotX,
+        rotY: msg.rotY ?? remoteState.rotY,
+        rotZ: msg.rotZ ?? remoteState.rotZ,
         glowEdge: msg.glowEdge ?? null,
-        tool: msg.tool ?? "none"
+        tool: msg.tool ?? "none",
+        axis: msg.axis ?? "none"
       };
     }
   });
   
   /* ============================================================
-     Boot on app:joined
+     Boot
      ============================================================ */
   window.addEventListener("app:joined", () => {
     const role = getRole();
-  
-    if (role === "expert") {
-      startExpert();
-    } else if (role === "novice") {
-      startNovice();
-    }
+    if (role === "expert") startExpert();
+    else if (role === "novice") startNovice();
   });
   
-  // Also: if someone loads the page without app.js events (dev testing),
-  // start novice renderer if novice canvas exists, otherwise do nothing.
+  // dev fallback
   (() => {
     const role = getRole();
-    if (!role && sceneCanvasNovice && noviceReadout) startNovice();
+    if (!role && (mvNovice || noviceReadout)) startNovice();
   })();

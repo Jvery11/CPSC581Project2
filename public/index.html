@@ -103,7 +103,15 @@
           </div>
   
           <div class="objectPanel">
-            <canvas id="scene_canvas"></canvas>
+            <model-viewer
+              id="mv_expert"
+              src="/models/Astronaut.glb"
+              camera-controls
+              touch-action="pan-y"
+              shadow-intensity="1"
+              style="width:100%; height:100%;"
+            ></model-viewer>
+            <canvas id="glow_canvas_expert"></canvas>
           </div>
         </div>
   
@@ -117,7 +125,15 @@
       <div id="noviceView" class="view hidden">
         <div class="noviceHud">
           <div class="objectPanel">
-            <canvas id="scene_canvas_novice"></canvas>
+            <model-viewer
+              id="mv_novice"
+              src="/models/Astronaut.glb"
+              camera-controls
+              touch-action="pan-y"
+              shadow-intensity="1"
+              style="width:100%; height:100%;"
+            ></model-viewer>
+            <canvas id="glow_canvas_novice"></canvas>
           </div>
   
           <div class="noviceReadout">
@@ -136,6 +152,7 @@
 
   <script src="app.js"></script>
   <script type="module" src="expert.js"></script>
+  <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/4.1.0/model-viewer.min.js"></script>
 </body>
 
 </html>
