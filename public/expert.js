@@ -494,22 +494,41 @@ import {
      Receive WS messages
      ============================================================ */
   window.addEventListener("app:ws", (e) => {
-    const msg = e.detail;
-    if (!msg || typeof msg !== "object") return;
-  
-    if (msg.type === "state") {
+  const msg = e.detail;
+  if (!msg || typeof msg !== "object") return;
+
+  if (msg.type === "joined") {
+    if (msg.modelUrl) {
+      if (mvNovice) mvNovice.src = msg.modelUrl;
+      if (mvExpert) mvExpert.src = msg.modelUrl; 
+    }
+    if (msg.state) {
       remoteState = {
-        nx: msg.nx ?? remoteState.nx,
-        ny: msg.ny ?? remoteState.ny,
-        rotX: msg.rotX ?? remoteState.rotX,
-        rotY: msg.rotY ?? remoteState.rotY,
-        rotZ: msg.rotZ ?? remoteState.rotZ,
-        glowEdge: msg.glowEdge ?? null,
-        tool: msg.tool ?? "none",
-        axis: msg.axis ?? "none"
+        ...remoteState,
+        ...msg.state,
       };
     }
-  });
+    return;
+  }
+
+  if (msg.type === "model") {
+    if (mvNovice) mvNovice.src = msg.url;
+    return;
+  }
+
+  if (msg.type === "state") {
+    remoteState = {
+      nx: msg.nx ?? remoteState.nx,
+      ny: msg.ny ?? remoteState.ny,
+      rotX: msg.rotX ?? remoteState.rotX,
+      rotY: msg.rotY ?? remoteState.rotY,
+      rotZ: msg.rotZ ?? remoteState.rotZ,
+      glowEdge: msg.glowEdge ?? null,
+      tool: msg.tool ?? "none",
+      axis: msg.axis ?? "none"
+    };
+  }
+});
   
   /* ============================================================
      Boot

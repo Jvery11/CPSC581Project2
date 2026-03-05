@@ -1,6 +1,6 @@
-// This server code has been created with AI
+// // This server code has been created with AI
 
-
+// server/server.js
 import http from "http";
 import express from "express";
 import { WebSocketServer } from "ws";
@@ -11,54 +11,79 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-
-// Serve ../public
 app.use(express.static(path.join(__dirname, "../public")));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-const rooms = new Map();
+let expert = null;
+const novices = new Set();
 
-function getRoom(roomId) {
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, { expert: null, novices: new Set(), lastText: "" });
+let lastText = "";
+let lastState = null;
+let lastModelUrl = "/models/Astronaut.glb";
+
+function broadcastToNovices(payload) {
+  const str = JSON.stringify(payload);
+  for (const n of novices) {
+    if (n.readyState === 1) n.send(str);
   }
-  return rooms.get(roomId);
 }
 
 wss.on("connection", (ws) => {
   ws.on("message", (data) => {
     let msg;
-    try { msg = JSON.parse(data.toString()); }
-    catch { return; }
-
-    if (msg.type === "join") {
-      ws.roomId = msg.roomId;
-      ws.role = msg.role;
-
-      const room = getRoom(msg.roomId);
-
-      if (msg.role === "expert") room.expert = ws;
-      else room.novices.add(ws);
-
-      ws.send(JSON.stringify({
-        type: "joined",
-        text: room.lastText
-      }));
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
       return;
     }
 
-    if (msg.type === "text" && ws.role === "expert") {
-      const room = getRoom(ws.roomId);
-      room.lastText = msg.text;
+    if (msg.type === "join") {
+      ws.role = msg.role;
 
-      for (const n of room.novices) {
-        if (n.readyState === 1) {
-          n.send(JSON.stringify({ type: "text", text: msg.text }));
-        }
+      if (msg.role === "expert") {
+        expert = ws;
+      } else {
+        novices.add(ws);
       }
+
+      ws.send(
+        JSON.stringify({
+          type: "joined",
+          text: lastText,
+          state: lastState,
+          modelUrl: lastModelUrl,
+        })
+      );
+      return;
     }
+
+    // Only the expert can broadcast updates
+    if (ws.role !== "expert") return;
+
+    if (msg.type === "text") {
+      lastText = msg.text ?? "";
+      broadcastToNovices({ type: "text", text: lastText });
+      return;
+    }
+
+    if (msg.type === "state") {
+      lastState = msg;
+      broadcastToNovices(msg);
+      return;
+    }
+
+    if (msg.type === "model") {
+      lastModelUrl = msg.url ?? lastModelUrl;
+      broadcastToNovices({ type: "model", url: lastModelUrl });
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    if (ws === expert) expert = null;
+    novices.delete(ws);
   });
 });
 
